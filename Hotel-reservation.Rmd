@@ -1,0 +1,628 @@
+---
+title: "Hotel reservation"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Data is from https://www.kaggle.com/jessemostipak/hotel-booking-demand
+We'll do some analysis on guest reservation cancellation behaviour and build a random forest model to predict whether guests would cancel their reservations.
+
+```{r echo = T, results = 'hide', warning=FALSE,message=FALSE}
+library(tidyverse)
+library(caret)
+library(pROC)
+library(zoo)
+library(corrplot)
+library(ROCR)
+options(dplyr.summarise.inform = FALSE)
+```
+
+
+```{r}
+data <- read.csv("hotel_bookings.csv")
+```
+
+```{r}
+str(data)
+summary(data)
+```
+
+
+<font size ="4"> **Features of the dataset** </font>
+
+Hotel: resort (H1) or city hotel (H2). Both hotels are located in Portugal: H1, a resort in Algarve, H2 a city hotel in Lisbon
+
+is_canceled: 1=cancelled, 0=not cancelled
+
+lead_time: no. of days elapsed between entering data of booking and the arrival date
+
+arrival_date_year: year of arrival date (2015-2017)
+
+arrival_date_month: month of arrival date (Jan-Dec)
+
+arrival_date_week_number: week number of year of arrival date (1-53)
+
+arrival_date_day_of_month: day of arrival date (1-31)
+
+stays_in_weekend_nights: no. of Saturday/Sundays guest stayed or booked to stay
+
+stays_in_week_nights: no. of week nights (Monday-Friday) guest stayed or booked to stay
+
+adults: no. of adults
+
+children: no. of children
+
+babies: no. of babies
+
+meal: type of meal booked (BB: bed & breakfast, HB: half board, FB: full board etc)
+
+country: country of origin in ISO (3 letters)
+
+market_segment: market segment designation (Direct, TA: travel agents, TO: tour operators etc.)
+
+distribution_channel: booking distribution channek (TA: travel agents, TO: tour operators etc.)
+
+is_repeated_guest: 1=from repeated guest, 0=not repeated guest
+
+previous_cancellations: no. of previous bookings that were cancelled prior to current booking
+
+previous_bookings_not_canceled
+
+reserved_room_type: A-D
+
+assigned_room_type: A-D
+
+booking_changes: no. of changes made to booking from the moment the booking was entered
+
+deposit_type: if the customer made a deposit to guarantee the booking
+
+agent: ID of the travel agency that made the booking
+
+company: ID of the company that made the booking or responsible for paying
+
+days_in_waiting_list: no. of days the booking was in waiting list before confirmed to the customer
+
+customer_type: type of booking (transient, transient-party, contract etc)
+
+adr: average daily rate (sum of all lodging transactions/total no. of staying nights)
+
+required_car_park: no. of car parking spaces required by customer
+
+total_of_special_requests: no. of special requests made (e.g. twin bed, high floor etc)
+
+reservation_status: canceled, check-out etc
+
+reservation_status_date
+
+
+
+```{r}
+which(is.na(data$children))
+data[c(40601, 40668, 40680, 41161),]
+```
+
+There are 4 missing values in the data.
+
+
+```{r}
+data$country[data$country == "CN"] <- "CHN"
+```
+Some entries of China were recorded as "CN" rather than "CHN".
+
+<font size ="4"> **Which countries booked the most?** </font>
+
+```{r}
+booking_stats <- data %>%
+  group_by(country) %>%
+  summarize(total_bookings = n()) %>%
+  arrange(desc(total_bookings))
+
+iso_continent <- read.csv("iso_continent.csv")
+iso_continent <- iso_continent[, c("Continent_Name", "Three_Letter_Country_Code")]
+colnames(iso_continent) = c("continent", "country")
+booking_stats <- left_join(booking_stats, iso_continent, by = "country")
+
+ggplot(booking_stats[1:20,], aes(x = reorder(country, -total_bookings), y = total_bookings, fill = continent, color = continent)) + 
+  geom_bar(stat="identity", width = 0.75) + 
+  geom_text(aes(label = total_bookings), position = position_dodge(width=1), vjust = -0.25, size = 2.4) +
+  ggtitle("Top 20 booking countries") +
+  xlab("Country") + ylab("Total bookings") +
+  theme(axis.text.x = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual("Continent", values = c("#58508d", "#bc5090", "#ff6361", "#ffa600")) +
+  scale_colour_manual("Continent", values = c("#58508d", "#bc5090", "#ff6361", "#ffa600"))
+```
+
+<font size ="4"> **Number of bookings the city hotel and resort received respectively** </font>
+
+```{r}
+data %>%
+  select(hotel, stays_in_week_nights, stays_in_weekend_nights) %>%
+  mutate(total_stay = stays_in_week_nights + stays_in_weekend_nights) %>%
+  ggplot(aes(x=hotel, y = total_stay, color = hotel)) + geom_boxplot() +
+  ggtitle("How long guests stay at the two hotels?") +
+  xlab("Hotel") + ylab("Length of stay per guest in days") +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+<font size ="4"> **How long in advance did people make reservations?** </font>
+
+```{r}
+data %>%
+  select(hotel, stays_in_week_nights, stays_in_weekend_nights) %>%
+  mutate(total_stay = stays_in_week_nights + stays_in_weekend_nights) %>%
+  ggplot(aes(x=total_stay, color = hotel, fill = hotel, alpha = 0.1)) + geom_density() +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  scale_fill_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  ggtitle("Distribution of lengths of stay per guest (days)") +
+  xlab("Length of stay per guest in days") +
+  ylab("Density") +
+  guides(alpha=FALSE) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**So, people tend to stay longer at the resort than at the city hotel.**
+
+<font size ="4"> **Do peoople from different nationalities have different preferences in booking resorts and city hotels?** </font>
+
+```{r}
+top_10 <- booking_stats$country[1:10]
+country_hotel_bookings <- data %>%
+  select(hotel, country) %>%
+  group_by(country, hotel) %>%
+  summarize(bookings = n()) %>%
+  filter(country %in% top_10)
+```
+
+```{r}
+ggplot(country_hotel_bookings, aes(x=reorder(country, -bookings), y = bookings, fill = hotel)) +
+  geom_bar(stat="identity", position = "dodge", width = 0.75) +
+  geom_text(aes(label = bookings), position = position_dodge(width=1), hjust = -0.1, size = 3, angle = 90) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("City hotel and resort bookings breakdown for top 10 countries") +
+  xlab("Country") + ylab("Bookings") +
+  lims(y=c(0, 35000)) +
+  scale_fill_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Among the top 10 visiting countries, it seems that more guests from continental Europe, China and Brazil booked for the city hotel whereas guests from the UK and Ireland were more likely to stay at the resort hotel.**
+
+<font size = "4"> **How long did guests stay?** </font>
+
+```{r}
+country_hotel_length <- data %>%
+  select(hotel, country, stays_in_week_nights, stays_in_weekend_nights) %>%
+  mutate(len_stay = stays_in_weekend_nights + stays_in_week_nights) %>%
+  filter(country %in% top_10)
+
+medians <- country_hotel_length %>%
+  group_by(hotel) %>%
+  summarize(med = median(len_stay))
+
+ggplot(country_hotel_length, aes(x=hotel, y=len_stay, color = hotel)) +
+  geom_boxplot() + ggtitle("How long do people stay in city hotels and resorts?") +
+  xlab("Hotel") + ylab("Length of stay (days)") +
+  scale_x_discrete(labels = c('City\nHotel', 'Resort\nHotel')) +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  geom_text(data = medians, aes(x = hotel, y = med, label = med, color = hotel), hjust = 13, show.legend = FALSE) + theme(plot.title = element_text(hjust = 0.5))
+  
+```
+
+**On average, people tended to stay longer at the resort hotel.**
+
+<font size = "4"> **How long did guests from different countries stay?** </font>
+
+```{r}
+ggplot(country_hotel_length, aes(x=hotel, y=len_stay, color = hotel)) +
+  geom_boxplot() + facet_wrap(~country) +
+  ggtitle("Length of stays per guest (in days) from different countries") +
+  xlab("Hotel") + ylab("Length of stays per guest (in days)") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  scale_x_discrete(labels = c('City\nHotel', 'Resort\nHotel'))
+```
+
+```{r}
+ggplot(country_hotel_length, aes(x = len_stay, color = hotel, fill = hotel, alpha = 0.05)) +
+  geom_density() + facet_wrap(~country) +
+  ggtitle("Length of stays per guest (in days) from different countries") +
+  xlab("Hotel") + ylab("Density") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  scale_fill_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  guides(alpha=FALSE)
+```
+
+**We can also see that for each country, more people booked at the city hotel compared to the resort, but stay in the resort for longer.**
+
+<font size = "4"> **Did guests from different countries book differently?** </font>
+
+```{r}
+data%>%
+  select(hotel, country, customer_type) %>%
+  filter(country %in% top_10) %>%
+  ggplot(aes(x=hotel, fill=customer_type)) +
+  geom_bar(position="dodge") +
+  facet_wrap(~country, scales = "free") +
+  scale_fill_manual("Customer type", values = c("#003f5c", "#58508d", "#ff6361", "#ffa600")) +
+  scale_x_discrete(labels = c('City\nHotel', 'Resort\nHotel')) +
+  theme(legend.key.size = unit(0.2, 'cm')) +
+  ggtitle("Did guests from different countries book differently?") +
+  xlab("Hotel") + ylab("Bookings") +
+  theme(plot.title = element_text(hjust = 0.5)) 
+```
+
+**It seems that there were much more contracted bookings from the UK and Ireland at the resort hotel compared to other countries.**
+
+
+<font size = "4"> **Mean daily price of hotels** </font>
+
+```{r}
+data$arrival_date <- as.Date(paste(data$arrival_date_year, data$arrival_date_month, data$arrival_date_day_of_month,sep = "-"), "%Y-%B-%d")
+
+data %>%
+  select(hotel, arrival_date, adr) %>%
+  group_by(hotel, arrival_date) %>%
+  summarize(mean_price = mean(adr)) %>%
+  ggplot(aes(x=arrival_date, y = mean_price, color = hotel)) + geom_line() +
+  ggtitle("Mean price of hotels every day") +
+  xlab("Arrival date") +
+  ylab("Mean daily price across all types of room") +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Rates were higher during summer months and lower during winter months. Difference in prices between summer and winter were more pronounced for the resort.**
+
+<font size = "4"> **How long in advance did people book?** </font>
+
+```{r}
+data %>%
+  select(hotel, arrival_date, lead_time) %>%
+  group_by(hotel, arrival_date) %>%
+  summarize(median_lead_time = median(lead_time)) %>%
+  ggplot(aes(x=arrival_date, y = median_lead_time, color = hotel)) +
+  geom_line() + ggtitle("Median lead time for arrivals on each day") +
+  xlab("Arrival date") + ylab("Median lead time") +
+  scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Guests tended to book more in advance for stays in summers, booking pattern was quite similar for both hotels.**
+
+<font size = "4"> **We want to study cancellation of hotel reservations. So let's do some EDA for that.** </font>
+
+```{r}
+ggplot(data, aes(x=reservation_status, fill = reservation_status)) + geom_bar() +
+  geom_text(stat = "count", aes(label = ..count.., color = reservation_status), vjust = -0.2, size = 3.5) +
+  scale_fill_manual("Reservation Status", values=c("#C70039", "#16A085", "#2980B9")) +
+  scale_color_manual("Reservation Status", values=c("#C70039", "#16A085", "#2980B9")) +
+  xlab("Reservation Status") + ylab("Counts") + ggtitle("Breakdown of reservation status") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**36.5% of the reservations were canceled and 1% were no-show.**
+
+<font size = "4"> **Cancellation breakdown for each hotel** </font>
+
+```{r}
+proportions <- data %>%
+  group_by(hotel, reservation_status) %>%
+  summarize(counts = n()) %>%
+  mutate(proportions = round(counts/sum(counts)*100,2))
+ggplot(data, aes(x=reservation_status, fill = reservation_status)) + geom_bar() +
+  facet_wrap(~hotel)+
+  geom_text(data = proportions, aes(x=reservation_status, y=counts, label =str_c(proportions,'%'), color = reservation_status), vjust = -0.2, size = 3.5) +
+  scale_fill_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  scale_color_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  xlab("Reservation Status") + ylab("Counts") + ggtitle("Breakdown of reservation status") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+<font size = "4"> **If guests have paid deposit, would they be less likely to cancel their reservation?** </font>
+
+```{r}
+data %>%
+  select(reservation_status, deposit_type) %>%
+  table() %>%
+  prop.table()
+```
+
+**Indeed, people who paid no deposit were more likely to cancel than those who have paid deposit (most deposits are non-refundable). However, even if someone has paid no deposit, it's still more likely that they would not cancel.**
+
+<font size = "4"> **Do higher prices make guests more likely to cancel their reservation, maybe they have found better prices elsewhere?** </font>
+
+```{r}
+data$is_canceled <- as.factor(data$is_canceled)
+data %>%
+  select(hotel, is_canceled, adr, reservation_status) %>%
+  ggplot(aes(x=reservation_status, y = adr, color = reservation_status)) + geom_boxplot()+
+  facet_wrap(~hotel) +
+  lims(y=c(0, 600)) +
+  scale_color_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  ggtitle("Distribution of average rate per night \n that ended up as check-in/cancelled/no-show") + xlab("Reservation status") + ylab("Average daily rate")
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Prices seemed to have a small effect on whether people would cancel or not show up for the city hotel. The effect was more pronounced for the resort, lower prices may have led to more people not showing up.**
+
+<font size = "4"> **Time trend of cancellations and no-show** </font>
+
+```{r}
+data%>%
+  select(hotel, reservation_status, arrival_date) %>%
+  mutate(arrival_month = as.yearmon(arrival_date, "%B %Y")) %>%
+  group_by(hotel, reservation_status, arrival_month) %>%
+  summarize(count = n()) %>%
+  ggplot(aes(x = arrival_month, y = count, fill = reservation_status)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_fill_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  ggtitle("Trend of cancellations and no-show") + xlab("Arrival date") +
+  ylab("Bookings") +
+  facet_wrap(~hotel) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**They largely followed the booking trend, in summer months when more people booked, there were also more cancellations.**
+
+
+<font size = "4"> **Special requests** </font>
+
+```{r}
+table(data$total_of_special_requests)
+```
+
+<font size = "4"> **Was there a correlation between special requests and cancellation?** </font>
+
+```{r}
+data %>%
+  ggplot(aes(x = total_of_special_requests, fill = reservation_status)) +
+  geom_bar() +
+  scale_fill_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  ggtitle("How many people with special requests cancelled booking or did not show up?") +
+  xlab("Number of special requests") +
+  ylab("Number of bookings") +
+  theme(plot.title = element_text(hjust = 0.5, size = 12))
+```
+
+**It seems like people with special requests tend to not cancel/no show. Perhaps hotels can prepare more facilities to cater for people with special requests.**
+
+<font size = "4"> **Lead time and cancellation** </font>
+
+```{r}
+data %>%
+  select(hotel, lead_time, reservation_status) %>%
+  ggplot(aes(x=reservation_status, y = lead_time, color = hotel)) +
+  geom_boxplot() +scale_color_manual("Hotel", values = c("#142459", "#1AC9E6")) +
+  xlab("Reservation status") + ylab("Lead time (days)") +
+  ggtitle("Distribution of booking lead time for each reservation status") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+<font size = "4"> **Were guests who have canceled previously more likely to cancel their reservation again?** </font>
+
+```{r}
+data %>%
+  select(hotel, previous_cancellations, reservation_status) %>%
+  ggplot(aes(x=reservation_status, y=previous_cancellations, color = reservation_status)) + geom_boxplot() +
+  scale_fill_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  ggtitle("Distribution of number of previous cancellations each customer made") +
+  xlab("Reservation status") + ylab("Number of previous cancellations each customer made") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+<font size = "4"> **Did different nationalities have different tendencies when it comes to canceling reservations? We'll look at the top 30 booking countries.** </font>
+
+```{r}
+country_status <- data %>%
+  group_by(country, reservation_status) %>%
+  summarize(counts = n()) %>%
+  spread(key = reservation_status, value = counts) %>%
+  mutate(Total = Canceled + `Check-Out` + `No-Show`) %>%
+  arrange(desc(Total)) %>%
+  head(30) %>%
+  mutate(Canceled = Canceled/Total) %>%
+  mutate(`No-Show` = `No-Show`/Total) %>%
+  mutate(`Check-Out` = `Check-Out`/Total) %>%
+  select(-Total) %>%
+  gather(key = reservation_status, proportion, Canceled:`No-Show`)
+```
+
+
+```{r}
+ggplot(country_status, 
+       aes(x=country, y = proportion, fill = reservation_status))+
+  geom_bar(stat ="identity") +
+  scale_fill_manual("Reservation status", values=c("#C70039", "#16A085", "#2980B9")) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Countries cancelling reservation and not showing up") +
+  xlab("Country") + ylab("Proportion of bookings") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**Looks like Portuguese, Angolese and Moroccans had the largest cancellation percentage. There were 47039 Portuguese bookings (55.1% canceled/no-show), 355 Angolese bookings (39% canceled/no-show) and 256 Morrocan bookings (39% canceled/no-show). Cancellation/no-show proportions were also high for Turkish (38.7%), Russians (36.7%), Luxembourgers (36.6%), Brazilians (35.9%) and Italians (34.9%).**
+
+**So far we've addressed relationships between reservation status and deposit, price, arrival month, number of special requests, lead time, people with cancellation history.**
+
+<font size = "4"> **Now we'll clean some data and investigate predictor correlation.** </font>
+
+```{r}
+boxplot(data$adr)
+title("Distribution of average daily rate")
+```
+
+**"adr" has some negative values and outlier (5400), these will be removed.**
+
+```{r}
+data <- data %>%
+  filter(adr > 0) %>%
+  filter(adr < 5400)
+```
+
+
+```{r}
+data$is_canceled <- as.factor(data$is_canceled)
+data$arrival_date_month <- as.factor(data$arrival_date_month)
+data$meal <- as.factor(data$meal)
+data$country <- as.factor(data$country)
+data$market_segment <- as.factor(data$market_segment)
+data$distribution_channel <- as.factor(data$distribution_channel)
+data$reserved_room_type <- as.factor(data$reserved_room_type)
+data$assigned_room_type <- as.factor(data$assigned_room_type)
+data$deposit_type <- as.factor(data$deposit_type)
+data$customer_type <- as.factor(data$customer_type)
+data$reservation_status <- as.factor(data$reservation_status)
+data$arrival_date <- as.Date(data$arrival_date)
+```
+
+**agent, company will be dropped**
+
+```{r}
+data$agent <- NULL
+data$company <- NULL
+```
+
+```{r}
+numeric <- data %>% select(where(is.numeric))
+numeric <- numeric %>% rename("arr_year" = "arrival_date_year") %>%
+  rename("arr_week" = "arrival_date_week_number") %>%
+  rename("arr_dom" = "arrival_date_day_of_month") %>%
+  rename("stay_weekends" = "stays_in_weekend_nights") %>%
+  rename("stay_weekdays" = "stays_in_week_nights") %>%
+  rename("returned_guest" = "is_repeated_guest") %>%
+  rename("past_cancel" = "previous_cancellations") %>%
+  rename("past_notcanc" = "previous_bookings_not_canceled") %>%
+  rename("book_change" = "booking_changes") %>%
+  rename("waiting_days" = "days_in_waiting_list") %>%
+  rename("park_spaces" = "required_car_parking_spaces") %>%
+  rename("spec_request" = "total_of_special_requests")%>%
+  cbind("is_canceled" = as.integer(data$is_canceled))
+```
+
+
+```{r}
+corrplot(cor(numeric, use="complete.obs"), method = "color", tl.cex=0.75,
+         tl.col = "black")
+```
+
+
+```{r}
+data$hotel <- as.factor(data$hotel)
+```
+
+**There are many countries in the dataset, so we'll group all those with total bookings less than 20 as "Others".**
+
+```{r}
+other_countries <- booking_stats$country[booking_stats$total_bookings < 20]
+data$country <- as.character(data$country)
+data$country[data$country %in% other_countries] <- "Others"
+data$country <- as.factor(data$country)
+```
+
+**Missing data in "children" will be imputed using the mode, Knnimpute and bagImpute will be much more computationally expensive.**
+
+```{r}
+data$children[is.na(data$children)] <- mode(data$children)
+data$children <- as.factor(data$children)
+```
+
+**The dataset is quite big and the model may be too slow to trained, so for this case, we'll just consider data from summer 2016 to summer 2017.**
+
+```{r}
+data_2017 <- data %>%
+  filter(reservation_status_date > "2016-07-01" & reservation_status_date < "2017-07-01")
+data_2017$reservation_status_date <- NULL
+
+data_2017 <- data_2017[, c(1:28)]
+```
+
+**Train/test partition**
+
+**8% of the data was used for training the model, this is a very small proportion. 8% was chosen because it took too long to train the model. Parallel programming (if hardware allows) or running it on cloud would be helpful.**
+
+```{r}
+set.seed(1234)
+train_index <- createDataPartition(data_2017$is_canceled, p= 0.08, list = FALSE)
+train <- data_2017[train_index,]
+test <- data_2017[-train_index,]
+```
+
+**A random forest algorithm will be used. We'll load the random forest model that has been trained previously using following code:**
+
+```{r}
+#myControl <- trainControl(method = "repeatedcv", number = 4, repeats = 2)
+#model_rf <- train(is_canceled ~ ., data = train, method = 'rf',
+#                  trainControl = myControl, tuneLength = 4)
+```
+
+
+```{r}
+model_rf <- readRDS("./hotel_model_rf_actual.rds")
+#model_rf$finalModel
+```
+
+**Checking if the random forest converged.**
+
+```{r}
+model_rf_oob_error_rate <- data.frame(Trees = rep(1:nrow(model_rf$finalModel$err.rate), times = 3),
+                                      Type = rep(c("OOB", "Not Canceled", "Canceled"), each =nrow(model_rf$finalModel$err.rate)),
+                                      Error = c(model_rf$finalModel$err.rate[,"OOB"],
+                                                model_rf$finalModel$err.rate[,"0"],
+                                                model_rf$finalModel$err.rate[,"1"]))
+head(model_rf_oob_error_rate)
+
+```
+
+
+```{r}
+ggplot(model_rf_oob_error_rate, aes(x=Trees, y=Error, color = Type))+
+  geom_line() + ggtitle("Has the forest converged?") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+**The forest did converge.**
+**The OOB error is 17.29%.**
+
+```{r}
+auc <- roc(train$is_canceled, model_rf$finalModel$votes[,"1"])
+```
+
+
+```{r}
+train_with_predict <- train
+train_with_predict$arrival_date <- as.Date(paste(train_with_predict$arrival_date_year, train_with_predict$arrival_date_month, train_with_predict$arrival_date_day_of_month,sep = "-"), "%Y-%B-%d")
+compared <- train_with_predict %>%
+  select(arrival_date, is_canceled) %>%
+  mutate(predicted = model_rf$finalModel$predicted)%>%
+  group_by(arrival_date) %>%
+  summarize(actual = sum(as.integer(is_canceled)), predicted = sum(as.integer(predicted)))
+```
+
+**Comparison between actual data and out-of-bag prediction**
+
+```{r}
+ggplot(compared, aes(x=arrival_date)) + geom_line(aes(y = actual), color = "blue") +
+  geom_line(aes(y=predicted), color = "red") + ggtitle("Actual data vs. random forest OOB prediction") + xlab("Arrival date") + ylab("Number of cancellations per day")
+```
+
+```{r}
+preds <- predict(model_rf, test)
+```
+
+
+```{r}
+confusionMatrix(test$is_canceled, preds)
+```
+
+**The model has an accuracy of 83.6% on the test set.**
+**Specificity is 82.16% and sensitivity is 84.23%. Ideally, the model should be tuned (using a bigger train set or longer tuneLength) to improve specificity, to lower the chance that we incorrectly identify a check-in as a cancellation. Other algorithms can also be tried.**
+
+
